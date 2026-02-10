@@ -33,6 +33,26 @@ def list_top_coins(vs="usd", per_page=100):
 
 
 @st.cache_data(ttl=3600)
+def fetch_markets_snapshot(vs="usd", per_page=50, page=1):
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": vs,
+        "order": "market_cap_desc",
+        "per_page": per_page,
+        "page": page,
+        "sparkline": "false",
+        "price_change_percentage": "24h,7d",
+    }
+    headers = {
+        "accept": "application/json",
+        "User-Agent": "regime-risk-radar/1.0 (Streamlit; contact: KhaledBalti95@gmail.com)",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json(), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+@st.cache_data(ttl=3600)
 def fetch_coingecko_market_chart(coin_id: str, days: int = 365, vs: str = "usd") -> tuple[pd.DataFrame, str]:
     """
     Returns (df, fetched_at_utc_str)
@@ -79,6 +99,7 @@ def fetch_coingecko_market_chart(coin_id: str, days: int = 365, vs: str = "usd")
             continue
         break
 
+    # Don’t crash app — return empty df and show error
     st.error(
         f"CoinGecko request failed (status {last_status}). "
         f"Try 365 days or wait. Snippet: {last_text}"
@@ -295,6 +316,59 @@ def add_regime_shading(fig: go.Figure, df_reg: pd.DataFrame):
     return fig
 
 
+def safe_fetch_with_730_fallback(coin_id: str, days: int) -> tuple[pd.DataFrame, str, int]:
+    """
+    Returns (df, fetched_at, used_days)
+    """
+    df, fetched = fetch_coingecko_market_chart(coin_id, days=days)
+    if df.empty and days == 730:
+        st.warning("730-day fetch failed (likely rate limit). Falling back to 365 days.")
+        df, fetched = fetch_coingecko_market_chart(coin_id, days=365)
+        return df, fetched, 365
+    return df, fetched, days
+
+
+def compute_asset_status(coin_label: str, coin_id: str, days: int, vol_window: int, mom_window: int) -> dict:
+    """
+    Used for watchlist: fetch -> features -> latest regime/signal.
+    Returns dict suitable for a table row.
+    """
+    df, fetched, used_days = safe_fetch_with_730_fallback(coin_id, days)
+    if df.empty or len(df) < 80:
+        return {
+            "Asset": coin_label,
+            "Regime": "—",
+            "Signal": "—",
+            "Risk": np.nan,
+            "Vol": np.nan,
+            "Momentum": np.nan,
+            "Drawdown": np.nan,
+            "Used days": used_days,
+            "Fetched at": fetched,
+            "Note": "Not enough data / fetch failed",
+        }
+
+    feat = compute_features(df, vol_window=vol_window, mom_window=mom_window)
+    reg = build_regime_series(feat)
+    latest = reg.iloc[-1]
+
+    signal, _ = decide_signal(latest)
+    regime, conf = decide_regime(latest)
+
+    return {
+        "Asset": coin_label,
+        "Regime": f"{regime} ({conf:.0f})",
+        "Signal": signal,
+        "Risk": float(latest.get("risk_score", np.nan)),
+        "Vol": float(latest.get("vol", np.nan)),
+        "Momentum": float(latest.get("mom", np.nan)),
+        "Drawdown": float(latest.get("drawdown", np.nan)),
+        "Used days": used_days,
+        "Fetched at": fetched,
+        "Note": "",
+    }
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -314,8 +388,11 @@ with st.sidebar:
     coin_id = coins[coin_label]
 
     compare_on = st.checkbox("Compare with a 2nd asset", value=True)
+    default_compare_label = next(
+        (k for k in coin_keys if "(ETH)" in k),
+        coin_keys[1] if len(coin_keys) > 1 else coin_keys[0]
+    )
 
-    default_compare_label = next((k for k in coin_keys if "(ETH)" in k), coin_keys[1] if len(coin_keys) > 1 else coin_keys[0])
     if compare_on:
         compare_label = st.selectbox(
             "2nd Asset",
@@ -332,10 +409,7 @@ with st.sidebar:
 
 # ---- Fetch primary with 730 fallback ----
 with st.spinner("Fetching data..."):
-    df1, fetched1 = fetch_coingecko_market_chart(coin_id, days=days)
-    if df1.empty and days == 730:
-        st.warning("730-day fetch failed (likely rate limit). Falling back to 365 days.")
-        df1, fetched1 = fetch_coingecko_market_chart(coin_id, days=365)
+    df1, fetched1, used_days1 = safe_fetch_with_730_fallback(coin_id, days)
 
 if df1.empty:
     st.stop()
@@ -351,10 +425,7 @@ risk1 = latest1.get("risk_score", np.nan)
 # ---- Fetch compare with 730 fallback ----
 if compare_on and compare_id:
     with st.spinner("Fetching comparison asset..."):
-        df2, fetched2 = fetch_coingecko_market_chart(compare_id, days=days)
-        if df2.empty and days == 730:
-            st.warning("730-day fetch failed for 2nd asset. Falling back to 365 days.")
-            df2, fetched2 = fetch_coingecko_market_chart(compare_id, days=365)
+        df2, fetched2, used_days2 = safe_fetch_with_730_fallback(compare_id, days)
 
     if not df2.empty:
         feat2 = compute_features(df2, vol_window=vol_window, mom_window=mom_window)
@@ -362,14 +433,13 @@ if compare_on and compare_id:
     else:
         feat2, reg2 = None, None
 else:
-    df2, fetched2, feat2, reg2 = None, None, None, None
+    df2, fetched2, feat2, reg2, used_days2 = None, None, None, None, None
 
 # Freshness banner
-st.caption(
-    f"Data source: CoinGecko (public API). "
-    f"Fetched {coin_label} at {fetched1}."
-    + (f" Fetched {compare_label} at {fetched2}." if compare_on and fetched2 else "")
-)
+fresh_line = f"Data source: CoinGecko (public API). Fetched {coin_label} at {fetched1} (range used: {used_days1} days)."
+if compare_on and compare_label and fetched2:
+    fresh_line += f" Fetched {compare_label} at {fetched2} (range used: {used_days2} days)."
+st.caption(fresh_line)
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Current Regime", regime1)
@@ -377,9 +447,13 @@ col2.metric("Regime Confidence", f"{conf1:.0f}/100")
 col3.metric("Paper Signal", signal1)
 col4.metric("Risk Score (0–100)", f"{risk1:.0f}" if pd.notna(risk1) else "—")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Signals & Why", "Backtest", "Methodology"])
+tabs = st.tabs(["Overview", "Signals & Why", "Backtest", "Watchlist", "Downloads", "Model Card"])
 
-with tab1:
+
+# -----------------------------
+# Overview
+# -----------------------------
+with tabs[0]:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=reg1["date"], y=reg1["price"], name=f"{coin_label} Price"))
     fig = add_regime_shading(fig, reg1)
@@ -400,7 +474,11 @@ with tab1:
             figc.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(figc, use_container_width=True)
 
-with tab2:
+
+# -----------------------------
+# Signals & Why
+# -----------------------------
+with tabs[1]:
     st.subheader("Decision explanation (paper, transparent rules)")
     for r in reasons1:
         st.write(f"- {r}")
@@ -409,7 +487,11 @@ with tab2:
     show_cols = ["date", "price", "ret", "vol", "mom", "drawdown", "w_energy_ratio", "risk_score", "regime", "signal"]
     st.dataframe(reg1[show_cols].tail(12), use_container_width=True)
 
-with tab3:
+
+# -----------------------------
+# Backtest
+# -----------------------------
+with tabs[2]:
     bt = backtest_signals(reg1)
     if bt.empty:
         st.warning("Not enough data to backtest yet.")
@@ -434,30 +516,114 @@ with tab3:
         c4.metric("Hit rate (daily)", f"{hit_rate:.1%}" if pd.notna(hit_rate) else "—")
         c5.metric("Exposure (time in market)", f"{exposure:.1%}" if pd.notna(exposure) else "—")
 
-with tab4:
+
+# -----------------------------
+# Watchlist (Top 10)
+# -----------------------------
+with tabs[3]:
+    st.subheader("Watchlist (Top 10 by market cap)")
+    st.write("This computes **regime / risk / signal** for the top coins. It may be slower due to public API limits (cached for 1 hour).")
+
+    snap_rows, snap_time = fetch_markets_snapshot(per_page=20, page=1)
+    top10 = snap_rows[:10]
+
+    cols = st.columns([1, 1, 2])
+    days_watch = cols[0].selectbox("Watchlist history (days)", [180, 365], index=0)
+    run_watch = cols[1].button("▶ Build / Refresh watchlist")
+    cols[2].caption(f"Snapshot fetched at {snap_time}")
+
+    if run_watch:
+        progress = st.progress(0)
+        table_rows = []
+        for i, c in enumerate(top10, start=1):
+            label = f"{c.get('name', 'Unknown')} ({str(c.get('symbol', '')).upper()})"
+            cid = c.get("id", "")
+            row = compute_asset_status(label, cid, days_watch, vol_window, mom_window)
+            # add snapshot fields (nice BI touch)
+            row["Mkt Cap Rank"] = c.get("market_cap_rank", np.nan)
+            row["Price"] = c.get("current_price", np.nan)
+            row["24h %"] = c.get("price_change_percentage_24h", np.nan)
+            row["7d %"] = c.get("price_change_percentage_7d_in_currency", np.nan)
+            table_rows.append(row)
+            progress.progress(int(i / len(top10) * 100))
+
+        wdf = pd.DataFrame(table_rows)
+        # nicer ordering
+        order = ["Mkt Cap Rank", "Asset", "Price", "24h %", "7d %", "Regime", "Signal", "Risk", "Vol", "Momentum", "Drawdown", "Used days", "Fetched at", "Note"]
+        wdf = wdf[[c for c in order if c in wdf.columns]]
+
+        st.dataframe(wdf, use_container_width=True)
+
+        # quick download
+        csv = wdf.to_csv(index=False).encode("utf-8")
+        st.download_button("Download watchlist CSV", data=csv, file_name="watchlist.csv", mime="text/csv")
+
+
+# -----------------------------
+# Downloads
+# -----------------------------
+with tabs[4]:
+    st.subheader("Download data")
+    st.write("Export the computed features and backtest results as CSV.")
+
+    features_csv = reg1.to_csv(index=False).encode("utf-8")
+    st.download_button("Download features CSV", data=features_csv, file_name="features.csv", mime="text/csv")
+
+    bt = backtest_signals(reg1)
+    if not bt.empty:
+        bt_csv = bt.to_csv(index=False).encode("utf-8")
+        st.download_button("Download backtest CSV", data=bt_csv, file_name="backtest.csv", mime="text/csv")
+    else:
+        st.info("Backtest CSV will appear once enough data exists.")
+
+
+# -----------------------------
+# Model Card / Product Notes (senior)
+# -----------------------------
+with tabs[5]:
+    st.header("Model Card / Product Notes")
+
     st.markdown(
-        """
-### What this is
-A **public, deployable data product** that turns crypto market data into:
-- regime classification (Risk-On / Risk-Off / Neutral)
-- risk scoring (0–100)
-- paper BUY/HOLD/SELL decisions with explanations
-- backtest vs buy & hold
+        f"""
+### Purpose
+A small but complete **data product** that turns public crypto market data into:
+- market **regimes** (Risk-On / Risk-Off / Neutral)
+- a **risk score** (0–100)
+- **paper** BUY / HOLD / SELL decisions with explanations
+- a leak-aware **backtest** vs Buy & Hold
 
-### Why wavelets
-Wavelet energy features help separate **trend-dominant** periods from **choppy/noise-dominant** periods across multiple time scales.
+### Data
+- Source: **CoinGecko public API**
+- Granularity: **daily**
+- Refresh model: **on demand** (cached up to 1 hour).  
+  Current fetch time: **{fetched1} UTC** (primary asset)
 
-### Leakage prevention (basic)
-Signals are computed on day *t* and executed on day *t+1* by shifting the position.
+### Decision logic (why rule-based)
+This version uses **transparent heuristic rules** to prioritize:
+- interpretability (“why did it say BUY?”)
+- stability under limited data
+- easy monitoring and iteration
 
-### Limitations
-- Daily data only (no intraday microstructure)
-- Rule-based regime + signals (transparent by design)
-- This is educational and not financial advice
+### Wavelets (why they’re here)
+Wavelet energy features capture **multi-scale structure**:
+- lower wavelet energy ratio → smoother, trend-dominant behavior
+- higher wavelet energy ratio → choppier/noise-dominant behavior
 
-### Next steps
+### Backtest integrity (basic)
+- Signal is computed at day **t**
+- Position is executed at **t+1** (shifted) to reduce lookahead bias
+
+### Known limitations
+- Daily candles only (no intraday order-book features)
+- Rule-based regimes (not probabilistic)
+- Performance is not optimized for returns (this is a product/engineering demo)
+
+### Next steps (if extending)
 - Probabilistic regime switching (HMM / change-point)
-- Multi-asset regime maps (correlation clusters)
-- Monitoring: signal decay, drift, regime stability
+- Multi-asset correlation + regime clustering
+- Monitoring: signal decay, drift, stability of regimes
 """
     )
+
+    st.markdown("### Disclaimer")
+    st.warning("Educational research tool. Paper signals only. Not financial advice.")
